@@ -64,6 +64,24 @@ Configuration::
     [ace2k]
     #heater_watts: 360     # the power of the heater, used for the energy in the log
                            # (see docs/hardware.md, "Heater"; measured about 340-380 W at 127 V)
+    #mains_voltage: 127    # the mains the unit runs on: the response check scales with V², so
+                           # 220 or 240 here on such mains (see "The response check" below)
+
+The response check
+------------------
+The unit faults ``response`` when the outlet rises faster than the heater can explain, which is
+its stand-in for a stopped fan or a blocked duct (``dryer_protect.c``). Its shape never changes::
+
+    rise over 30 s  >  K * sum(duty over the 30 s) + floor
+
+``K`` is in m°C/s per 1 % of duty. Only the mains changes it: the heater fires whole half-cycles,
+so one pulse carries the full V²/R power, and the rise per percent scales with V². The fit is
+``K = 35`` at 127 V (``docs/hardware.md``, "Heater"). At 220 V that duty delivers 3.0x the power;
+the unit measured 72 m°C/s per % there (2026-11-24), so a 220 V box wants 105-130, and with the
+compiled 35 it faults about 31 s into every cycle. ``mains_voltage: 220`` sends 105, which leaves
+the same 2.4x margin the 127 V value has on this unit's data (42.0 °C allowed against 17.2 °C
+measured). There is deliberately no knob to widen it further: a unit that still faults with its
+airflow proven good has a hardware question to answer, not a threshold to raise.
 """
 
 from __future__ import annotations
@@ -121,6 +139,19 @@ READY_SEED_S = 0.1  # delay of the log read after klippy:ready; a query blocks, 
 LOG_ENTRIES = 8
 LOG_READ_ATTEMPTS = 3  # a log read that saw a new entry is repeated, at most this many times
 LOG_TEMP_UNKNOWN_DC = -32768  # INT16_MIN of the unit: the reading was invalid or missing
+# The response check's ceiling at the mains its fit was made on, and the floor sent with it. See
+# "The response check" in the module docstring. The floor and the range are the same numbers as the
+# unit's ACE2K_DRYER_RISE_FLOOR_MC and ACE2K_DRYER_RISE_MC_S_PCT_MIN/MAX: change both together.
+RISE_MC_S_PER_PCT_REF = 35.0
+MAINS_VOLTAGE_REF = 127.0
+RISE_FLOOR_MC = 2000
+RISE_MC_S_PCT_MIN = 5
+RISE_MC_S_PCT_MAX = 300
+LIMITS_FMT = "ace2k_dryer_limits rise_mc_s_pct=%hu floor_mc=%hu"
+# The minutes a cycle was asked for. A query of its own, so that neither an older image nor an
+# older host has to know it (docs/protocol.md, "The dryer").
+TOTAL_QUERY = "ace2k_dryer_total_query"
+TOTAL_FMT = "ace2k_dryer_total total_min=%hu"
 
 # The dryer modes' names by the unit's code. ace2k_dryer_print and ace2k_dryer_mode re-export both.
 MODE_NAMES = {0: "manual", 1: "humidity", 2: "print"}
@@ -261,6 +292,7 @@ class Fields(TypedDict):
     drive: float | None  # noqa: V107
     duty: int | None
     remaining: int | None  # noqa: V107
+    duration: int | None  # noqa: V107 — the minutes the cycle was asked for; None when none runs
     fans: dict[str, bool] | None
     flaps: dict[str, str] | None
     fault: str | None  # noqa: V107
@@ -390,13 +422,35 @@ class Ace2kDryer:
         self.mcu = unit.mcu  # the MCU of the unit, resolved once from the mcu key of its section
         self.section = config.get_name()
         self.heater_watts = config.getfloat("heater_watts", HEATER_WATTS, above=0.0)
+        # The response check's ceiling, derived from the mains. K is the rise per 1 % of duty in
+        # m°C/s (module docstring, "The response check"); the floor is sent with it, unchanged.
+        self.mains_voltage = config.getfloat("mains_voltage", MAINS_VOLTAGE_REF, above=0.0)
+        wanted = int(round(RISE_MC_S_PER_PCT_REF
+                           * (self.mains_voltage / MAINS_VOLTAGE_REF) ** 2))
+        self.rise_mc_s_pct = min(max(wanted, RISE_MC_S_PCT_MIN), RISE_MC_S_PCT_MAX)
+        if self.rise_mc_s_pct != wanted:
+            logging.warning(
+                "%s: mains_voltage %g V asks for %d m°C/s per %%; clamped to %d-%d",
+                self.unit.head(),
+                self.mains_voltage,
+                wanted,
+                RISE_MC_S_PCT_MIN,
+                RISE_MC_S_PCT_MAX,
+            )
         self.airflow_present = self.dryer_present = False
+        # The minutes the running cycle was asked for. A start of this host sets it from its own
+        # argument; a connect takes it from the unit (ace2k_dryer_total_query), so a host restart
+        # over a running cycle still knows. None when no cycle runs.
+        self.duration: int | None = None
+        # The unit's own query for it; None on an image without the command.
+        self.total_query: QueryCommand | None = None
         self.fields = Fields(
             state=None,
             target=None,
             drive=None,
             duty=None,
             remaining=None,
+            duration=None,
             fans=None,
             flaps=None,
             fault=None,
@@ -459,6 +513,25 @@ class Ace2kDryer:
         ticks = self.mcu.seconds_to_clock(REPORT_S)
         self.mcu.add_config_cmd(f"{query.split(maxsplit=1)[0]} rest_ticks={ticks}", is_init=True)
 
+    def _send_limits(self) -> None:
+        """Give the unit the response check's ceiling, at every connect.
+
+        It is an init command, so Klipper sends it on each connect: a reset, which brings the
+        unit's compiled default back, needs nothing else. An image older than the command keeps
+        its compiled value, and the probe says so once."""
+        verdict, detail = probe_format(self.mcu, LIMITS_FMT)
+        if verdict == "differs":
+            raise refuse_format(self.printer, self.section, LIMITS_FMT, (verdict, detail))
+        if verdict != "ok":
+            logging.info(
+                "%s firmware without ace2k_dryer_limits; the response check keeps its compiled"
+                " value (%s)",
+                self.unit.head(),
+                detail,
+            )
+            return
+        self.mcu.add_config_cmd(LIMITS_FMT % (self.rise_mc_s_pct, RISE_FLOOR_MC), is_init=True)
+
     def _forget_events(self) -> None:
         """Forget the event base at every connect.
 
@@ -520,6 +593,16 @@ class Ace2kDryer:
             START_FMT,
         )
         self.dryer_present = True
+        # The response check's ceiling, before anything can start a cycle.
+        self._send_limits()
+        # The total of a cycle already running (a host restart over it). An image without the
+        # query leaves this None, and the status shows the remaining time alone.
+        verdict, detail = probe_format(self.mcu, TOTAL_QUERY)
+        if verdict == "differs":
+            raise refuse_format(self.printer, self.section, TOTAL_QUERY, (verdict, detail))
+        self.total_query = (
+            self.mcu.lookup_query_command(TOTAL_QUERY, TOTAL_FMT) if verdict == "ok" else None
+        )
         # Built once. Every request reuses them, whether it comes from a G-code or from a host
         # module in a timer.
         self.requests = {
@@ -568,13 +651,35 @@ class Ace2kDryer:
                 " is power-cycled (a restart does not clear it)",
                 self.unit.head("dryer"),
             )
+        self._read_total()
         return self.reactor.NEVER
+
+    def _read_total(self) -> None:
+        """Take the minutes of a running cycle from the unit, once per connect.
+
+        A host that restarts over a running cycle has no other way to learn it. The unit clears
+        the value when the cycle ends, so a connect with nothing running reads 0, and the status
+        shows no total."""
+        if self.total_query is None:
+            return
+        try:
+            params = ask(self.printer, self.mcu, self.total_query, [], "dryer total")
+        except NoAnswerError as e:
+            logging.warning("%s dryer total query failed: %s", self.unit.head(), e)
+            return
+        self.duration = params["total_min"] or None
+        self.fields["duration"] = self.duration
 
     # --- reports and events (the serial thread) -------------------------------------------
 
     def _handle_state(self, params: Params) -> None:
         state = STATE_NAMES.get(params["state"], params["state"])
         running = state != "idle"
+        # The total only means something while a cycle runs; a stop, a fault or the end of the
+        # cycle clears it, as the unit clears its own (a cycle ended is not a plan any more).
+        cycling = state in ("starting", "heating")
+        if not cycling:
+            self.duration = None
         notices = notices_of(params["notices"])
         unstored = "log_unstored" in notices
         if unstored and not self.log_unstored:
@@ -592,6 +697,7 @@ class Ace2kDryer:
                 "drive": params["drive_dc"] / 10.0 if running and params["drive_dc"] else None,
                 "duty": params["duty"],
                 "remaining": params["remaining_min"] if running else None,
+                "duration": self.duration if cycling else None,
                 "fans": fans_of(params["fans"]),
                 "flaps": flaps_of(params["flaps"]),
                 "fault": FAULT_NAMES.get(params["fault"]),
@@ -759,7 +865,13 @@ class Ace2kDryer:
             if f["drive"] is not None:
                 line += f" (drive {f['drive']:.1f} °C, duty {f['duty']} %)"
             if f["remaining"] is not None and f["state"] in ("starting", "heating"):
-                line += f", {format_minutes(f['remaining'])} left"
+                if f["duration"]:
+                    line += (
+                        f", {format_minutes(f['remaining'])} of"
+                        f" {format_minutes(f['duration'])} left"
+                    )
+                else:
+                    line += f", {format_minutes(f['remaining'])} left"
             if f["fault"] is not None:
                 line += f"; fault {f['fault']}"
         if f["notices"]:
@@ -905,6 +1017,10 @@ class Ace2kDryer:
                 "ace2k: ACEK_DRY needs DURATION=<minutes, or with an h / m suffix>, 1 min to 24 h"
             )
         self._dryer_request(gcmd, "start", START_FMT, [temp, minutes])
+        # The request carries the total, so no query is needed after a start of this host. It also
+        # covers a retarget: ACEK_DRY over a running cycle replaces its target and time in place.
+        self.duration = minutes
+        self.fields["duration"] = minutes
         gcmd.respond_info(f"ace2k: drying at {temp} °C for {format_minutes(minutes)}")
 
     cmd_ACEK_DRY_STOP_help = "Stop drying; the fans run until the heater is cool"
@@ -912,6 +1028,8 @@ class Ace2kDryer:
     def cmd_ACEK_DRY_STOP(self, gcmd: GCodeCommand) -> None:
         self._require_dryer(gcmd)
         self._dryer_request(gcmd, "stop", STOP_FMT)
+        self.duration = None  # the unit clears its own at the stop; the next report confirms
+        self.fields["duration"] = None
         gcmd.respond_info("ace2k: dryer stopping — the unit cools the heater down with the fans")
 
     cmd_ACEK_DRY_CLEAR_help = "Leave a dryer fault once the heater is cool (not a tripped cutout)"

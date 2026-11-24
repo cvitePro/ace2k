@@ -85,10 +85,33 @@
 #define ACE2K_DRYER_RISE_LAG_WEIGHT_PCT   25 /* initial value; re-tune on the bench */
 #define ACE2K_DRYER_RISE_SLOTS            (ACE2K_DRYER_RISE_WINDOW_S + ACE2K_DRYER_RISE_LAG_S + 1U)
 #define ACE2K_DRYER_RISE_SAMPLE_MS        1000U
-#define ACE2K_DRYER_RISE_MAX_MC_S_PER_PCT 35 /* from tools/thermal_fit.py; re-tune on the bench */
+/* The response check. Its shape never changes:
+ *
+ *     rise over ACE2K_DRYER_RISE_WINDOW_S  >  K x sum(duty over the window) + floor
+ *
+ * K is in m°C/s per 1 % of duty, the floor in m°C. Only K depends on the mains: the heater fires
+ * whole half-cycles, so one pulse carries the full V²/R power, and the rise per percent of duty
+ * scales with V². K = 35 is the fit at 127 V (tools/thermal_fit.py). At 220-240 V the same duty
+ * delivers (220/127)² = 3.0x the power: the unit measured 72 m°C/s per % on 2026-11-24 (45 °C
+ * cycle, 12.7 % mean duty: 17.2 °C in 30 s against a 15.3 °C ceiling), which faults a cycle on the
+ * first tick the window is full. 105-130 keeps the margin the 127 V value has.
+ *
+ * These two are the compiled defaults of the runtime fields ace2k_dryer.rise_mc_s_pct and
+ * .rise_floor_mc, which `ace2k_dryer_limits` sets: the host derives K from `[ace2k]
+ * mains_voltage` (ace2k_dryer.py).
+ * They live in RAM, so a reset brings these defaults back and the host sends them again at every
+ * connect, like any other init value. */
+#define ACE2K_DRYER_RISE_MAX_MC_S_PER_PCT 35
 #define ACE2K_DRYER_RISE_MARGIN_PCT                                                                \
     100 /* the ceiling above already carries the fit's 1.5x; re-tune on the bench */
 #define ACE2K_DRYER_RISE_FLOOR_MC  2000   /* initial value; re-tune on the bench */
+/* The range the host may set. Under 5 m°C/s per % a cold unit faults on its first full window
+ * (that is below the 127 V fit's own noise), and over 300 (8.6x the fit) a stopped fan or a
+ * blocked duct would no longer move the temperature past the ceiling. A floor above 10 °C would
+ * hide a rise at a standstill. */
+#define ACE2K_DRYER_RISE_MC_S_PCT_MIN 5
+#define ACE2K_DRYER_RISE_MC_S_PCT_MAX 300
+#define ACE2K_DRYER_RISE_FLOOR_MC_MAX 10000
 #define ACE2K_DRYER_SIDES_APART_MC 15000  /* initial value */
 #define ACE2K_DRYER_SIDES_MS       60000U /* initial value; re-tune on the bench */
 /* The chamber ceiling. The chamber faults at 10 °C over its base for 30 s (dryer_internal.h), or
@@ -323,6 +346,10 @@ struct ace2k_dryer {
     uint32_t phase_rejects_start; /* heat's phase_rejects at the start */
     uint8_t target_c;
     uint8_t highest_target_c; /* the cycle's highest target: the base of the chamber ceiling */
+    /* The minutes a cycle was asked for, 0 when none runs. ace2k_dryer_total_query reads it: the
+     * factory firmware reports the same field as `duration` in its status, and ace2k's state frame
+     * has no room for it without breaking an older host (docs/protocol.md, "The dryer"). */
+    uint16_t total_min;
     int32_t start_chamber_mc; /* lowest valid chamber reading since the start: the floor of the
                                * ceiling (dryer_internal.h) */
     bool shut;                /* a Klipper shutdown happened: nothing moves any more */
@@ -351,6 +378,11 @@ struct ace2k_dryer {
     bool have_inputs;
     int32_t ntc_held_mc[2]; /* last valid value of each NTC, left then right; 0 before the first */
     struct ace2k_dryer_ctl ctl;
+    /* The response check's ceilings. They hold the compiled defaults (dryer.h) until the host sets
+     * them with ace2k_dryer_limits, which is a runtime write: a reset brings the defaults back, and
+     * the host sends them again at every connect. */
+    uint16_t rise_mc_s_pct;
+    uint16_t rise_floor_mc;
     struct ace2k_dryer_protect prot;
     struct ace2k_dryer_event ring[ACE2K_DRYER_EVENT_RING];
     volatile uint8_t ring_head, ring_tail;

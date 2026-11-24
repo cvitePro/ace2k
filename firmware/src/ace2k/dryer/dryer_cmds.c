@@ -48,6 +48,11 @@
 DECL_CONSTANT("ACE2K_DRYER_TARGET_MIN_C", ACE2K_DRYER_TARGET_MIN_C);
 DECL_CONSTANT("ACE2K_DRYER_TARGET_MAX_C", ACE2K_DRYER_TARGET_MAX_C);
 DECL_CONSTANT("ACE2K_DRYER_MINUTES_MAX", ACE2K_DRYER_MINUTES_MAX);
+// The range of ace2k_dryer_limits, for the host and the panel to read. ace2k_dryer.py carries the
+// same numbers: change both together.
+DECL_CONSTANT("ACE2K_DRYER_RISE_MC_S_PCT_MIN", ACE2K_DRYER_RISE_MC_S_PCT_MIN);
+DECL_CONSTANT("ACE2K_DRYER_RISE_MC_S_PCT_MAX", ACE2K_DRYER_RISE_MC_S_PCT_MAX);
+DECL_CONSTANT("ACE2K_DRYER_RISE_FLOOR_MC_MAX", ACE2K_DRYER_RISE_FLOOR_MC_MAX);
 // NOLINTEND(bugprone-signed-bitwise)
 
 static struct ace2k_dryer ace2k_dryer_instance;
@@ -362,6 +367,50 @@ void ace2k_dryer_cmd_clear(uint32_t *args)
     ace2k_dryer_binding_respond(ACE2K_DRYER_OP_CLEAR, r);
 }
 DECL_COMMAND(ace2k_dryer_cmd_clear, "ace2k_dryer_clear");
+
+// The host sets the response check's ceilings, from `[ace2k] mains_voltage` (ace2k_dryer.py).
+// They live in RAM: a reset brings the compiled
+// defaults back, and the host sends them again at every connect, as it does with every init
+// value. 0 keeps the compiled default. A value outside the dictionary's range is a host bug, so
+// it takes the Klipper way out (a shutdown), as a log index above 8 does.
+// cppcheck-suppress constParameterPointer
+void ace2k_dryer_cmd_limits(uint32_t *args)
+{
+    ensure_ready();
+    uint32_t rise = args[0];
+    uint32_t floor_mc = args[1];
+    if (rise == 0U) {
+        rise = ACE2K_DRYER_RISE_MAX_MC_S_PER_PCT;
+    }
+    if (floor_mc == 0U) {
+        floor_mc = ACE2K_DRYER_RISE_FLOOR_MC;
+    }
+    if (rise < ACE2K_DRYER_RISE_MC_S_PCT_MIN || rise > ACE2K_DRYER_RISE_MC_S_PCT_MAX ||
+        floor_mc > ACE2K_DRYER_RISE_FLOOR_MC_MAX) {
+        shutdown("ace2k_dryer_limits: value out of range");
+    }
+    irqstatus_t flag = irq_save();
+    ace2k_dryer_instance.rise_mc_s_pct = (uint16_t)rise;
+    ace2k_dryer_instance.rise_floor_mc = (uint16_t)floor_mc;
+    irq_restore(flag);
+}
+DECL_COMMAND(ace2k_dryer_cmd_limits, "ace2k_dryer_limits rise_mc_s_pct=%hu floor_mc=%hu");
+
+// The minutes the running cycle was asked for, 0 when none runs. A query of its own rather than a
+// field of ace2k_dryer_state: a state frame with one more field would make every older host refuse
+// the connect (probe_format answers "differs"), while an image without this command simply leaves
+// an older host asking nothing. The factory firmware reports the same number as `duration` in its
+// status; ace2k had dropped it (docs/protocol.md, "The dryer").
+void ace2k_dryer_cmd_total_query(uint32_t *args)
+{
+    (void)args;
+    ensure_ready();
+    irqstatus_t flag = irq_save();
+    uint16_t total = ace2k_dryer_instance.total_min;
+    irq_restore(flag);
+    sendf("ace2k_dryer_total total_min=%hu", total);
+}
+DECL_COMMAND(ace2k_dryer_cmd_total_query, "ace2k_dryer_total_query");
 
 // The host's query also says that it listens. From the first query on, the events leave,
 // the boot events among them. Each query sends every unacknowledged event again. That happens at

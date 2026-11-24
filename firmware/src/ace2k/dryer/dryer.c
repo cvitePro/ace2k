@@ -264,6 +264,7 @@ static void enter_cooldown(struct ace2k_dryer *self, uint8_t kind,
 {
     ace2k_heat_release(self->heat);
     self->ctl.duty_cpct = 0U;
+    self->total_min = 0U; /* the cycle is over: the factory firmware reports 0 here too */
     ace2k_dryer_emit(self, kind, 0U);
     cool_begin(self, in, now_ms);
     set_state(self, ACE2K_DRYER_COOLDOWN, now_ms);
@@ -277,6 +278,7 @@ static void enter_fault(struct ace2k_dryer *self, uint8_t reason,
     }
     ace2k_heat_abort(self->heat); /* a fault: no half-cycle after it, not even a pending one */
     self->ctl.duty_cpct = 0U;
+    self->total_min = 0U; /* no plan survives the fault, as with a completed cycle */
     self->fault = reason;
     /* This cannot fail. The dryer outranks every other owner, and a fan-on is never refused for
      * heat. */
@@ -487,6 +489,10 @@ void ace2k_dryer_init(struct ace2k_dryer *self, struct ace2k_heat *heat,
     self->heat = heat;
     self->airflow = airflow;
     self->log = log;
+    /* The response check's ceilings stay at the compiled defaults until the host sets them
+     * (ace2k_dryer_limits). The host sends them at every connect, so a reset is harmless. */
+    self->rise_mc_s_pct = ACE2K_DRYER_RISE_MAX_MC_S_PER_PCT;
+    self->rise_floor_mc = ACE2K_DRYER_RISE_FLOOR_MC;
     set_state(self, ACE2K_DRYER_IDLE, now_ms);
     /* The flaps hold their position when unpowered. A cool-down cut short by a reset leaves them
      * open, and nothing on the page says where they are. So the boot closes both from the first
@@ -574,6 +580,7 @@ enum ace2k_dryer_refusal ace2k_dryer_start(struct ace2k_dryer *self, uint8_t tar
     }
     self->target_c = target_c;
     self->highest_target_c = target_c;
+    self->total_min = minutes;
     self->end_ms = now_ms + ((uint32_t)minutes * ACE2K_DRYER_MS_PER_MIN);
     self->notices = 0U;
     /* Valid, because start_inputs_refusal checked it. The ticks lower it from here
@@ -638,6 +645,7 @@ enum ace2k_dryer_refusal ace2k_dryer_retarget(struct ace2k_dryer *self, uint8_t 
     if (target_c > self->highest_target_c) {
         self->highest_target_c = target_c;
     }
+    self->total_min = minutes;
     self->end_ms = now_ms + ((uint32_t)minutes * ACE2K_DRYER_MS_PER_MIN);
     self->notices &= (uint8_t)~ACE2K_DRYER_NOTICE_LOWERED;
     return ACE2K_DRYER_OK;

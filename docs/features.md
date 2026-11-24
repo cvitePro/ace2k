@@ -84,6 +84,7 @@ For the Snapmaker U1, see the [`ace2k-u1`](https://github.com/tobecwb/ace2k-u1) 
     #                             # minimum, up to 2000 mm
     #rfid_mifare_order: bambu, snapmaker, creality
     #heater_watts: 360            # the dryer's heater power, for ACEK_DRYER_LOG's energy
+    #mains_voltage: 127           # scales the `response` ceiling by (V/127)²: 220 V → 105
 
     [include ace2k_tags.cfg]
 

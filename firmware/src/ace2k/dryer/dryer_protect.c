@@ -149,10 +149,13 @@ static uint8_t check_response(struct ace2k_dryer *self, const struct ace2k_dryer
     uint8_t newest = (uint8_t)((p->win_idx + ACE2K_DRYER_RISE_SLOTS - 1U) % ACE2K_DRYER_RISE_SLOTS);
     uint8_t first = (uint8_t)((newest + ACE2K_DRYER_RISE_SLOTS - ACE2K_DRYER_RISE_WINDOW_S) %
                               ACE2K_DRYER_RISE_SLOTS);
-    int32_t limit = ((ACE2K_DRYER_RISE_MAX_MC_S_PER_PCT * driving_duty_sum(p, newest) *
+    /* K and the floor come from the runtime fields: the host sets them at every connect from
+     * `[ace2k] mains_voltage`, because K scales with the mains voltage squared (dryer.h,
+     * "The response check"). */
+    int32_t limit = (((int32_t)self->rise_mc_s_pct * driving_duty_sum(p, newest) *
                       ACE2K_DRYER_RISE_MARGIN_PCT) /
                      PROTECT_PCT) +
-                    ACE2K_DRYER_RISE_FLOOR_MC;
+                    (int32_t)self->rise_floor_mc;
     if (p->win_ntc_mc[newest] - p->win_ntc_mc[first] > limit) {
         return ACE2K_DRYER_FAULT_RESPONSE;
     }
